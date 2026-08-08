@@ -1,7 +1,5 @@
 """
-🤖 ADVANCED BOT & HTML HOSTING BOT
-• যেকোনো নামের Python/Node.js বট হোস্ট করার সুবিধা
-• HTML ওয়েবসাইট হোস্ট করে সরাসরি Web URL তৈরি করার ফিচার
+🤖 ADVANCED BOT & HTML HOSTING BOT (Path & 404 Fix)
 """
 
 import os
@@ -14,6 +12,7 @@ import time
 import threading
 import zipfile
 import mimetypes
+import urllib.parse
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -28,8 +27,8 @@ BOTS_DIR.mkdir(exist_ok=True)
 
 DB_FILE = Path("database.json")
 
-# Render Domain Auto Detect (Render-এ অ্যাপ রান হলে স্বয়ংক্রিয়ভাবে URL পেয়ে যাবে)
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
+# Render Domain Auto Detect
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000").rstrip("/")
 
 # ==================== DATABASE MANAGEMENT ====================
 def load_db() -> dict:
@@ -45,27 +44,26 @@ def save_db(db: dict):
 
 # ==================== ENTRY FILE DETECTOR ====================
 def find_entry_file(bot_dir: Path):
-    """১. প্রথমে স্ট্যান্ডার্ড নাম খুঁজবে, না পেলে যেকোনো .py, .js বা .html ফাইল বেছে নেবে"""
-    # স্ট্যান্ডার্ড নামসমূহ
     priority_targets = ["index.html", "main.py", "bot.py", "app.py", "index.js", "bot.js", "server.js"]
     for target in priority_targets:
         found = list(bot_dir.rglob(target))
         if found:
             return found[0]
 
-    # স্ট্যান্ডার্ড না পেলে যেকোনো .py, .js বা .html ফাইল
     all_files = [f for f in bot_dir.rglob("*") if f.is_file()]
     for f in all_files:
-        if f.suffix in [".py", ".js", ".html"]:
+        if f.suffix in [".py", ".js", ".html", ".htm"]:
             return f
     return None
 
-# ==================== WEB & HTML SERVER ====================
+# ==================== WEB & HTML SERVER (FIXED PATH RESOLUTION) ====================
 class CustomWebServer(BaseHTTPRequestHandler):
     def do_GET(self):
-        # HTML ফাইল ব্রাউজারে সার্ভ করার রাউটিং: /site/<bot_id>/<file_path>
-        if self.path.startswith("/site/"):
-            parts = self.path.strip("/").split("/", 2)
+        # Clean query strings and URL encoding
+        clean_path = urllib.parse.unquote(self.path.split('?')[0])
+
+        if clean_path.startswith("/site/"):
+            parts = clean_path.strip("/").split("/", 2)
             if len(parts) >= 2:
                 bot_id = parts[1]
                 rel_path = parts[2] if len(parts) > 2 else ""
@@ -74,13 +72,22 @@ class CustomWebServer(BaseHTTPRequestHandler):
                 bot_info = db["bots"].get(bot_id)
                 if bot_info:
                     bot_dir = Path(bot_info["path"])
-                    if not rel_path or rel_path == "/":
-                        entry = find_entry_file(bot_dir)
-                        target_file = entry if entry else bot_dir / "index.html"
-                    else:
-                        target_file = bot_dir / rel_path
+                    target_file = None
 
-                    if target_file.exists() and target_file.is_file():
+                    if not rel_path or rel_path == "/":
+                        target_file = find_entry_file(bot_dir)
+                    else:
+                        direct_file = bot_dir / rel_path
+                        if direct_file.exists() and direct_file.is_file():
+                            target_file = direct_file
+                        else:
+                            # Search subfolders automatically if path isn't flat
+                            fname = Path(rel_path).name
+                            found = list(bot_dir.rglob(fname))
+                            if found:
+                                target_file = found[0]
+
+                    if target_file and target_file.exists() and target_file.is_file():
                         mime_type, _ = mimetypes.guess_type(str(target_file))
                         self.send_response(200)
                         self.send_header('Content-type', mime_type or 'text/html; charset=utf-8')
@@ -89,11 +96,12 @@ class CustomWebServer(BaseHTTPRequestHandler):
                         return
 
             self.send_response(404)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.end_headers()
             self.wfile.write(b"404 Not Found - Website or File does not exist.")
             return
 
-        # Render Keep-Alive Default Page
+        # Default Keep-Alive Ping
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
@@ -150,8 +158,7 @@ def start_hosted_bot(bid: str) -> str:
     if not entry_path:
         return "❌ কোনো রান করার মতো ফাইল পাওয়া যায়নি!"
 
-    # HTML ফাইল হলে বটের মতো ব্যাকগ্রাউন্ড প্রসেস লাগবে না, সরাসরি ওয়েবসাইট হিসেবে কাজ করবে
-    if entry_path.suffix == ".html":
+    if entry_path.suffix in [".html", ".htm"]:
         return "🌐 এটি একটি HTML ওয়েবসাইট। এটি অটোমেটিক ২৪/৭ লাইভ আছে!"
 
     install_dependencies(bot_dir)
@@ -222,7 +229,7 @@ def main_menu_kb() -> types.InlineKeyboardMarkup:
 
 def bot_control_kb(bid: str, is_html: bool, web_url: str = "") -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
-    
+
     if is_html:
         kb.add(types.InlineKeyboardButton("🌐 Open Website", url=web_url))
     else:
@@ -301,7 +308,8 @@ def handle_file_upload(m: types.Message):
             return
 
         is_html = entry.suffix in [".html", ".htm"]
-        web_url = f"{BASE_URL}/site/{bot_id}/{entry.name}"
+        rel_entry_path = entry.relative_to(bot_dir).as_posix()
+        web_url = f"{BASE_URL}/site/{bot_id}/{rel_entry_path}"
 
         db["bots"][bot_id] = {
             "name": doc.file_name,
