@@ -1,6 +1,5 @@
 """
-🤖 ADVANCED TELEGRAM BOT HOSTING BOT (Render Compatible)
-সব ধরণের Python/Node.js টেলিগ্রাম বট অটোমেটিক প্যাকেজ ইনস্টলসহ হোস্ট করার বট
+🤖 ADVANCED TELEGRAM BOT HOSTING BOT (Render Compatible - Fixed)
 """
 
 import os
@@ -50,7 +49,7 @@ def load_db() -> dict:
     if DB_FILE.exists():
         try:
             return json.loads(DB_FILE.read_text())
-        except:
+        except Exception:
             pass
     return {"users": {}, "bots": {}}
 
@@ -70,30 +69,15 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 RUNNING_PROCESSES = {}
 
 # ==================== HELPER FUNCTIONS ====================
-def get_user(uid: int) -> dict:
-    db = load_db()
-    suid = str(uid)
-    if suid not in db["users"]:
-        db["users"][suid] = {"plan": "free", "bots": [], "joined": str(datetime.now())}
-        save_db(db)
-    return db["users"][suid]
-
-def can_create_bot(uid: int) -> bool:
-    user = get_user(uid)
-    limit = {"free": 3, "premium": 10, "pro": 25}.get(user.get("plan", "free"), 3)
-    return len(user.get("bots", [])) < limit
-
 def find_entry_file(bot_dir: Path):
-    """ফোল্ডারের ভেতরে যেকোনো জায়গায় মেইন ফাইল খুঁজে বের করে"""
     targets = ["main.py", "bot.py", "app.py", "index.js", "bot.js", "server.js"]
     for target in targets:
         found = list(bot_dir.rglob(target))
         if found:
-            return found[0]  # Return absolute Path object
+            return found[0]
     return None
 
 def install_dependencies(bot_dir: Path):
-    """আপলোড করা বটের requirements.txt থাকলে অটো ইনস্টল করে"""
     req_files = list(bot_dir.rglob("requirements.txt"))
     if req_files:
         try:
@@ -123,10 +107,8 @@ def start_hosted_bot(bid: str) -> str:
     if not entry_path:
         return "❌ কোনো মেইন ফাইল পাওয়া যায়নি! (main.py, bot.py, index.js ইত্যাদি থাকা আবশ্যক)"
 
-    # ইনস্টল ডিপেনডেন্সি
     install_dependencies(bot_dir)
 
-    # ফাইলটাইপ অনুযায়ী রান কমান্ড
     is_python = entry_path.suffix == ".py"
     cmd = [sys.executable, entry_path.name] if is_python else ["node", entry_path.name]
 
@@ -146,7 +128,6 @@ def start_hosted_bot(bid: str) -> str:
             "started": time.time()
         }
 
-        # ব্যাকগ্রাউন্ডে লগ রিডার
         def capture_logs():
             for line in iter(proc.stdout.readline, ""):
                 if bid in RUNNING_PROCESSES:
@@ -165,10 +146,10 @@ def stop_hosted_bot(bid: str) -> str:
             proc = RUNNING_PROCESSES[bid]["process"]
             proc.terminate()
             proc.wait(timeout=3)
-        except:
+        except Exception:
             try:
                 RUNNING_PROCESSES[bid]["process"].kill()
-            except:
+            except Exception:
                 pass
         del RUNNING_PROCESSES[bid]
         return "🔴 বট বন্ধ করা হয়েছে।"
@@ -214,7 +195,12 @@ def bot_control_kb(bid: str) -> types.InlineKeyboardMarkup:
 # ==================== BOT HANDLERS ====================
 @bot.message_handler(commands=['start'])
 def cmd_start(m: types.Message):
-    get_user(m.from_user.id)
+    db = load_db()
+    suid = str(m.from_user.id)
+    if suid not in db["users"]:
+        db["users"][suid] = {"plan": "free", "bots": [], "joined": str(datetime.now())}
+        save_db(db)
+
     text = (
         f"👋 **Hello {m.from_user.first_name}!**\n\n"
         f"🤖 **Bot Hosting Server Panel**\n"
@@ -226,9 +212,16 @@ def cmd_start(m: types.Message):
 @bot.message_handler(content_types=['document'])
 def handle_file_upload(m: types.Message):
     uid = m.from_user.id
-    user = get_user(uid)
+    suid = str(uid)
+    db = load_db()
 
-    if not can_create_bot(uid):
+    if suid not in db["users"]:
+        db["users"][suid] = {"plan": "free", "bots": [], "joined": str(datetime.now())}
+
+    user = db["users"][suid]
+    limit = {"free": 3, "premium": 10, "pro": 25}.get(user.get("plan", "free"), 3)
+
+    if len(user.get("bots", [])) >= limit:
         bot.reply_to(m, "❌ আপনার বট লিমিট শেষ! আরও বট হোস্ট করতে প্ল্যান আপগ্রেড করুন।")
         return
 
@@ -260,19 +253,19 @@ def handle_file_upload(m: types.Message):
             bot.edit_message_text("❌ আপলোড করা ফাইলে কোনো মূল ফাইল (`main.py`, `bot.py`, `index.js`) পাওয়া যায়নি!", chat_id=m.chat.id, message_id=msg.message_id)
             return
 
-        db = load_db()
+        # ডাটাবেজে সঠিক নিয়মে একইসাথে আপডেট ও সেভ করা হচ্ছে
         db["bots"][bot_id] = {
             "name": doc.file_name,
             "path": str(bot_dir),
             "owner": uid,
             "uploaded": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
-        user["bots"].append(bot_id)
+        db["users"][suid]["bots"].append(bot_id)
         save_db(db)
 
         bot.edit_message_text(
             f"✅ **বট আপলোড সফল হয়েছে!**\n\n"
-            f"🆔 **Bot ID:** `+{bot_id}`\n"
+            f"🆔 **Bot ID:** `{bot_id}`\n"
             f"📁 **File:** `{doc.file_name}`\n"
             f"📄 **Entry:** `{entry.name}`\n\n"
             f"নিচের **My Bots** অপশনে গিয়ে বট চালু করুন।",
@@ -288,6 +281,7 @@ def handle_file_upload(m: types.Message):
 def handle_callbacks(c: types.CallbackQuery):
     data = c.data
     uid = c.from_user.id
+    suid = str(uid)
     chat_id = c.message.chat.id
 
     if data == "menu_main":
@@ -295,11 +289,10 @@ def handle_callbacks(c: types.CallbackQuery):
 
     elif data == "menu_my_bots":
         db = load_db()
-        user = get_user(uid)
-        user_bots = user.get("bots", [])
+        user_bots = db["users"].get(suid, {}).get("bots", [])
 
         if not user_bots:
-            bot.answer_callback_query(c.id, "আপনার কোনো আপলোড করা বট নেই!")
+            bot.answer_callback_query(c.id, "আপনার কোনো আপলোড করা বট নেই!", show_alert=True)
             return
 
         kb = types.InlineKeyboardMarkup(row_width=1)
@@ -318,7 +311,8 @@ def handle_callbacks(c: types.CallbackQuery):
         bot.answer_callback_query(c.id)
 
     elif data == "menu_profile":
-        user = get_user(uid)
+        db = load_db()
+        user = db["users"].get(suid, {})
         bot.edit_message_text(
             f"👤 **User Profile**\n\n"
             f"🆔 **ID:** `{uid}`\n"
@@ -358,7 +352,6 @@ def handle_callbacks(c: types.CallbackQuery):
         bot.answer_callback_query(c.id, "বট চালু হচ্ছে...")
         res = start_hosted_bot(bid)
         bot.send_message(chat_id, res)
-        # Refresh state
         db = load_db()
         bot_info = db["bots"].get(bid)
         if bot_info:
@@ -385,8 +378,8 @@ def handle_callbacks(c: types.CallbackQuery):
         if bid in db["bots"]:
             shutil.rmtree(db["bots"][bid]["path"], ignore_errors=True)
             del db["bots"][bid]
-            if str(uid) in db["users"] and bid in db["users"][str(uid)]["bots"]:
-                db["users"][str(uid)]["bots"].remove(bid)
+            if suid in db["users"] and bid in db["users"][suid]["bots"]:
+                db["users"][suid]["bots"].remove(bid)
             save_db(db)
         bot.answer_callback_query(c.id, "🗑️ বট সফলভাবে মুছে ফেলা হয়েছে!")
         bot.edit_message_text("🤖 **Main Control Panel**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=main_menu_kb())
@@ -398,7 +391,6 @@ if __name__ == "__main__":
     print("🤖 Main Bot Hosting Control Panel Started!")
     try:
         bot.delete_webhook()
-    except:
+    except Exception:
         pass
     bot.infinity_polling(skip_pending=True)
-    
