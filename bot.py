@@ -1,5 +1,7 @@
 """
-🤖 ADVANCED TELEGRAM BOT HOSTING BOT (Render Compatible - Fixed)
+🤖 ADVANCED BOT & HTML HOSTING BOT
+• যেকোনো নামের Python/Node.js বট হোস্ট করার সুবিধা
+• HTML ওয়েবসাইট হোস্ট করে সরাসরি Web URL তৈরি করার ফিচার
 """
 
 import os
@@ -11,6 +13,7 @@ import secrets
 import time
 import threading
 import zipfile
+import mimetypes
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -25,24 +28,8 @@ BOTS_DIR.mkdir(exist_ok=True)
 
 DB_FILE = Path("database.json")
 
-# ==================== RENDER DUMMY WEB SERVER ====================
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        self.wfile.write(b"Bot Hosting Panel is Live 24/7!")
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    try:
-        server = HTTPServer(('0.0.0.0', port), DummyHandler)
-        print(f"🌐 Keep-Alive server listening on port {port}")
-        server.serve_forever()
-    except Exception as e:
-        print(f"Server warning: {e}")
-
-threading.Thread(target=run_dummy_server, daemon=True).start()
+# Render Domain Auto Detect (Render-এ অ্যাপ রান হলে স্বয়ংক্রিয়ভাবে URL পেয়ে যাবে)
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
 
 # ==================== DATABASE MANAGEMENT ====================
 def load_db() -> dict:
@@ -56,7 +43,74 @@ def load_db() -> dict:
 def save_db(db: dict):
     DB_FILE.write_text(json.dumps(db, indent=2))
 
-# ==================== TELEGRAM BOT INITIALIZATION ====================
+# ==================== ENTRY FILE DETECTOR ====================
+def find_entry_file(bot_dir: Path):
+    """১. প্রথমে স্ট্যান্ডার্ড নাম খুঁজবে, না পেলে যেকোনো .py, .js বা .html ফাইল বেছে নেবে"""
+    # স্ট্যান্ডার্ড নামসমূহ
+    priority_targets = ["index.html", "main.py", "bot.py", "app.py", "index.js", "bot.js", "server.js"]
+    for target in priority_targets:
+        found = list(bot_dir.rglob(target))
+        if found:
+            return found[0]
+
+    # স্ট্যান্ডার্ড না পেলে যেকোনো .py, .js বা .html ফাইল
+    all_files = [f for f in bot_dir.rglob("*") if f.is_file()]
+    for f in all_files:
+        if f.suffix in [".py", ".js", ".html"]:
+            return f
+    return None
+
+# ==================== WEB & HTML SERVER ====================
+class CustomWebServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # HTML ফাইল ব্রাউজারে সার্ভ করার রাউটিং: /site/<bot_id>/<file_path>
+        if self.path.startswith("/site/"):
+            parts = self.path.strip("/").split("/", 2)
+            if len(parts) >= 2:
+                bot_id = parts[1]
+                rel_path = parts[2] if len(parts) > 2 else ""
+
+                db = load_db()
+                bot_info = db["bots"].get(bot_id)
+                if bot_info:
+                    bot_dir = Path(bot_info["path"])
+                    if not rel_path or rel_path == "/":
+                        entry = find_entry_file(bot_dir)
+                        target_file = entry if entry else bot_dir / "index.html"
+                    else:
+                        target_file = bot_dir / rel_path
+
+                    if target_file.exists() and target_file.is_file():
+                        mime_type, _ = mimetypes.guess_type(str(target_file))
+                        self.send_response(200)
+                        self.send_header('Content-type', mime_type or 'text/html; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(target_file.read_bytes())
+                        return
+
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"404 Not Found - Website or File does not exist.")
+            return
+
+        # Render Keep-Alive Default Page
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b"<h1>Server is Live 24/7!</h1><p>Bot & HTML Hosting Engine Running.</p>")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = HTTPServer(('0.0.0.0', port), CustomWebServer)
+        print(f"🌐 Server listening on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Server warning: {e}")
+
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# ==================== TELEGRAM BOT SETUP ====================
 try:
     import telebot
     from telebot import types
@@ -68,15 +122,6 @@ except ImportError:
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 RUNNING_PROCESSES = {}
 
-# ==================== HELPER FUNCTIONS ====================
-def find_entry_file(bot_dir: Path):
-    targets = ["main.py", "bot.py", "app.py", "index.js", "bot.js", "server.js"]
-    for target in targets:
-        found = list(bot_dir.rglob(target))
-        if found:
-            return found[0]
-    return None
-
 def install_dependencies(bot_dir: Path):
     req_files = list(bot_dir.rglob("requirements.txt"))
     if req_files:
@@ -87,25 +132,27 @@ def install_dependencies(bot_dir: Path):
                 text=True,
                 timeout=60
             )
-            return True
         except Exception as e:
             print(f"Req install error: {e}")
-    return False
 
 # ==================== PROCESS CONTROL ====================
 def start_hosted_bot(bid: str) -> str:
     db = load_db()
     bot_info = db["bots"].get(bid)
     if not bot_info:
-        return "❌ বট খুঁজে পাওয়া যায়নি!"
+        return "❌ হোস্টিং খুঁজে পাওয়া যায়নি!"
 
     bot_dir = Path(bot_info["path"])
     if not bot_dir.exists():
-        return "❌ বটের ফোল্ডারটি মিসিং!"
+        return "❌ ফোল্ডারটি মিসিং!"
 
     entry_path = find_entry_file(bot_dir)
     if not entry_path:
-        return "❌ কোনো মেইন ফাইল পাওয়া যায়নি! (main.py, bot.py, index.js ইত্যাদি থাকা আবশ্যক)"
+        return "❌ কোনো রান করার মতো ফাইল পাওয়া যায়নি!"
+
+    # HTML ফাইল হলে বটের মতো ব্যাকগ্রাউন্ড প্রসেস লাগবে না, সরাসরি ওয়েবসাইট হিসেবে কাজ করবে
+    if entry_path.suffix == ".html":
+        return "🌐 এটি একটি HTML ওয়েবসাইট। এটি অটোমেটিক ২৪/৭ লাইভ আছে!"
 
     install_dependencies(bot_dir)
 
@@ -152,43 +199,41 @@ def stop_hosted_bot(bid: str) -> str:
             except Exception:
                 pass
         del RUNNING_PROCESSES[bid]
-        return "🔴 বট বন্ধ করা হয়েছে।"
-    return "⚠️ বটটি ইতিপূর্বে বন্ধ ছিল।"
+        return "🔴 প্রসেস বন্ধ করা হয়েছে।"
+    return "⚠️ প্রসেসটি ইতিপূর্বে বন্ধ ছিল।"
 
 def get_hosted_logs(bid: str) -> str:
     if bid in RUNNING_PROCESSES:
         logs = RUNNING_PROCESSES[bid].get("logs", [])
-        if not logs:
-            return "লগ লোড হচ্ছে..."
-        return "\n".join(logs[-25:])
-    return "⚠️ বট বন্ধ রয়েছে। কোনো রানিং লগ নেই।"
+        return "\n".join(logs[-25:]) if logs else "লগ লোড হচ্ছে..."
+    return "⚠️ কোনো রানিং লগ নেই।"
 
 # ==================== KEYBOARDS ====================
 def main_menu_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("🤖 My Bots", callback_data="menu_my_bots"),
-        types.InlineKeyboardButton("📤 Upload Bot", callback_data="menu_upload")
+        types.InlineKeyboardButton("🤖 My Uploads", callback_data="menu_my_bots"),
+        types.InlineKeyboardButton("📤 Upload File", callback_data="menu_upload")
     )
     kb.add(
-        types.InlineKeyboardButton("👤 Profile", callback_data="menu_profile"),
-        types.InlineKeyboardButton("💳 Plans", callback_data="menu_plans")
+        types.InlineKeyboardButton("👤 Profile", callback_data="menu_profile")
     )
     return kb
 
-def bot_control_kb(bid: str) -> types.InlineKeyboardMarkup:
+def bot_control_kb(bid: str, is_html: bool, web_url: str = "") -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
-    is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
-
-    if is_running:
-        kb.add(types.InlineKeyboardButton("⏹️ Stop Bot", callback_data=f"act_stop_{bid}"))
+    
+    if is_html:
+        kb.add(types.InlineKeyboardButton("🌐 Open Website", url=web_url))
     else:
-        kb.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"act_start_{bid}"))
+        is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
+        if is_running:
+            kb.add(types.InlineKeyboardButton("⏹️ Stop Bot", callback_data=f"act_stop_{bid}"))
+        else:
+            kb.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"act_start_{bid}"))
+        kb.add(types.InlineKeyboardButton("📋 View Logs", callback_data=f"act_logs_{bid}"))
 
-    kb.add(
-        types.InlineKeyboardButton("📋 View Logs", callback_data=f"act_logs_{bid}"),
-        types.InlineKeyboardButton("🗑️ Delete", callback_data=f"act_del_{bid}")
-    )
+    kb.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"act_del_{bid}"))
     kb.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
     return kb
 
@@ -203,9 +248,10 @@ def cmd_start(m: types.Message):
 
     text = (
         f"👋 **Hello {m.from_user.first_name}!**\n\n"
-        f"🤖 **Bot Hosting Server Panel**\n"
-        f"আপনার Python বা Node.js বট এখানে সম্পূর্ণ বিনামূল্যে ২৪/৭ হোস্ট করুন।\n\n"
-        f"📤 বট আপলোড করতে সরাসরি `.zip` বা `.py` ফাইল এই চ্যাটে পাঠান।"
+        f"🤖 **Bot & HTML Hosting Panel**\n"
+        f"• Python/Node.js বট ব্যাকগ্রাউন্ডে রান করুন\n"
+        f"• HTML ফাইল আপলোড করে অটো লাইভ ওয়েবসাইট লিংক বানিয়ে নিন\n\n"
+        f"📤 আপলোড করতে `.zip`, `.py`, `.js` অথবা `.html` ফাইল সেন্ড করুন।"
     )
     bot.send_message(m.chat.id, text, reply_markup=main_menu_kb())
 
@@ -219,19 +265,20 @@ def handle_file_upload(m: types.Message):
         db["users"][suid] = {"plan": "free", "bots": [], "joined": str(datetime.now())}
 
     user = db["users"][suid]
-    limit = {"free": 3, "premium": 10, "pro": 25}.get(user.get("plan", "free"), 3)
+    limit = {"free": 5, "premium": 15}.get(user.get("plan", "free"), 5)
 
     if len(user.get("bots", [])) >= limit:
-        bot.reply_to(m, "❌ আপনার বট লিমিট শেষ! আরও বট হোস্ট করতে প্ল্যান আপগ্রেড করুন।")
+        bot.reply_to(m, "❌ আপলোড লিমিট শেষ!")
         return
 
     doc = m.document
     fname = doc.file_name.lower()
-    if not (fname.endswith('.zip') or fname.endswith('.py') or fname.endswith('.js')):
-        bot.reply_to(m, "❌ শুধুমাত্র `.zip`, `.py` অথবা `.js` ফাইল গ্রহণযোগ্য।")
+    allowed_exts = ('.zip', '.py', '.js', '.html', '.htm')
+    if not fname.endswith(allowed_exts):
+        bot.reply_to(m, "❌ শুধুমাত্র `.zip`, `.py`, `.js` অথবা `.html` ফাইল গ্রহণযোগ্য।")
         return
 
-    msg = bot.reply_to(m, "⏳ ফাইল প্রসেস করা হচ্ছে এবং ডিপেনডেন্সি চেক করা হচ্ছে...")
+    msg = bot.reply_to(m, "⏳ ফাইল প্রসেস করা হচ্ছে...")
 
     try:
         file_info = bot.get_file(doc.file_id)
@@ -250,32 +297,46 @@ def handle_file_upload(m: types.Message):
         entry = find_entry_file(bot_dir)
         if not entry:
             shutil.rmtree(bot_dir, ignore_errors=True)
-            bot.edit_message_text("❌ আপলোড করা ফাইলে কোনো মূল ফাইল (`main.py`, `bot.py`, `index.js`) পাওয়া যায়নি!", chat_id=m.chat.id, message_id=msg.message_id)
+            bot.edit_message_text("❌ ফাইলে উপযোগী কোনো কোড ফাইল পাওয়া যায়নি!", chat_id=m.chat.id, message_id=msg.message_id)
             return
 
-        # ডাটাবেজে সঠিক নিয়মে একইসাথে আপডেট ও সেভ করা হচ্ছে
+        is_html = entry.suffix in [".html", ".htm"]
+        web_url = f"{BASE_URL}/site/{bot_id}/{entry.name}"
+
         db["bots"][bot_id] = {
             "name": doc.file_name,
             "path": str(bot_dir),
             "owner": uid,
+            "is_html": is_html,
+            "web_url": web_url,
             "uploaded": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
         db["users"][suid]["bots"].append(bot_id)
         save_db(db)
 
+        if is_html:
+            reply_text = (
+                f"✅ **HTML ওয়েবসাইট হোস্টিং সফল!**\n\n"
+                f"📁 **File:** `{doc.file_name}`\n"
+                f"🌐 **Hosted URL:**\n`{web_url}`"
+            )
+        else:
+            reply_text = (
+                f"✅ **কোড আপলোড সফল হয়েছে!**\n\n"
+                f"📁 **File:** `{doc.file_name}`\n"
+                f"📄 **Entry Point:** `{entry.name}`\n\n"
+                f"বট স্টার্ট করতে **My Uploads** অপশনে যান।"
+            )
+
         bot.edit_message_text(
-            f"✅ **বট আপলোড সফল হয়েছে!**\n\n"
-            f"🆔 **Bot ID:** `{bot_id}`\n"
-            f"📁 **File:** `{doc.file_name}`\n"
-            f"📄 **Entry:** `{entry.name}`\n\n"
-            f"নিচের **My Bots** অপশনে গিয়ে বট চালু করুন।",
+            reply_text,
             chat_id=m.chat.id,
             message_id=msg.message_id,
             reply_markup=main_menu_kb()
         )
 
     except Exception as e:
-        bot.edit_message_text(f"❌ আপলোড ব্যর্থ হয়েছে: {str(e)}", chat_id=m.chat.id, message_id=msg.message_id)
+        bot.edit_message_text(f"❌ প্রসেসিং ব্যর্থ: {str(e)}", chat_id=m.chat.id, message_id=msg.message_id)
 
 @bot.callback_query_handler(func=lambda c: True)
 def handle_callbacks(c: types.CallbackQuery):
@@ -292,22 +353,26 @@ def handle_callbacks(c: types.CallbackQuery):
         user_bots = db["users"].get(suid, {}).get("bots", [])
 
         if not user_bots:
-            bot.answer_callback_query(c.id, "আপনার কোনো আপলোড করা বট নেই!", show_alert=True)
+            bot.answer_callback_query(c.id, "আপনার কোনো আপলোড করা ফাইল নেই!", show_alert=True)
             return
 
         kb = types.InlineKeyboardMarkup(row_width=1)
         for bid in user_bots:
             if bid in db["bots"]:
-                bname = db["bots"][bid]["name"]
-                is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
-                status = "🟢" if is_running else "🔴"
+                binfo = db["bots"][bid]
+                bname = binfo["name"]
+                if binfo.get("is_html"):
+                    status = "🌐"
+                else:
+                    is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
+                    status = "🟢" if is_running else "🔴"
                 kb.add(types.InlineKeyboardButton(f"{status} {bname}", callback_data=f"select_{bid}"))
 
         kb.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
-        bot.edit_message_text("🤖 **আপনার হোস্ট করা বট সমূহের তালিকা:**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=kb)
+        bot.edit_message_text("🤖 **আপনার আপলোড করা প্রজেক্টসমূহ:**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=kb)
 
     elif data == "menu_upload":
-        bot.send_message(chat_id, "📤 আপনার বটের `.zip` অথবা `.py` ফাইলটি চ্যাটে সেন্ড করুন।")
+        bot.send_message(chat_id, "📤 আপনার `.py`, `.js`, `.html` অথবা ওয়েবসাইট/বটের `.zip` ফাইল সেন্ড করুন।")
         bot.answer_callback_query(c.id)
 
     elif data == "menu_profile":
@@ -316,8 +381,7 @@ def handle_callbacks(c: types.CallbackQuery):
         bot.edit_message_text(
             f"👤 **User Profile**\n\n"
             f"🆔 **ID:** `{uid}`\n"
-            f"💎 **Plan:** `{user.get('plan', 'free').upper()}`\n"
-            f"🤖 **Total Bots:** {len(user.get('bots', []))}\n"
+            f"📦 **Total Hosted:** {len(user.get('bots', []))}\n"
             f"📅 **Joined:** {user.get('joined', '')[:10]}",
             chat_id=chat_id,
             message_id=c.message.message_id,
@@ -330,32 +394,37 @@ def handle_callbacks(c: types.CallbackQuery):
         bot_info = db["bots"].get(bid)
 
         if not bot_info:
-            bot.answer_callback_query(c.id, "বট খুঁজে পাওয়া যায়নি!")
+            bot.answer_callback_query(c.id, "তথ্য পাওয়া যায়নি!")
             return
 
-        is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
-        status = "🟢 Running" if is_running else "🔴 Stopped"
+        is_html = bot_info.get("is_html", False)
+        web_url = bot_info.get("web_url", "")
+
+        if is_html:
+            status_text = f"🌐 **Live Website**\n\n🔗 **URL:** `{web_url}`"
+        else:
+            is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
+            status = "🟢 Running" if is_running else "🔴 Stopped"
+            status_text = f"📊 **Status:** {status}"
 
         bot.edit_message_text(
-            f"⚙️ **Bot Manager**\n\n"
+            f"⚙️ **Project Details**\n\n"
             f"📛 **Name:** `{bot_info['name']}`\n"
-            f"🆔 **ID:** `{bid}`\n"
-            f"📊 **Status:** {status}\n"
+            f"{status_text}\n"
             f"📅 **Uploaded:** {bot_info.get('uploaded', 'N/A')}",
             chat_id=chat_id,
             message_id=c.message.message_id,
-            reply_markup=bot_control_kb(bid)
+            reply_markup=bot_control_kb(bid, is_html, web_url)
         )
 
     elif data.startswith("act_start_"):
         bid = data[10:]
-        bot.answer_callback_query(c.id, "বট চালু হচ্ছে...")
         res = start_hosted_bot(bid)
-        bot.send_message(chat_id, res)
+        bot.answer_callback_query(c.id, res)
         db = load_db()
         bot_info = db["bots"].get(bid)
         if bot_info:
-            bot.edit_message_text(f"⚙️ **Bot Manager**\n\n📛 **Name:** `{bot_info['name']}`\n📊 **Status:** 🟢 Running", chat_id=chat_id, message_id=c.message.message_id, reply_markup=bot_control_kb(bid))
+            bot.edit_message_text(f"⚙️ **Project Details**\n\n📛 **Name:** `{bot_info['name']}`\n📊 **Status:** 🟢 Running", chat_id=chat_id, message_id=c.message.message_id, reply_markup=bot_control_kb(bid, False))
 
     elif data.startswith("act_stop_"):
         bid = data[9:]
@@ -364,12 +433,12 @@ def handle_callbacks(c: types.CallbackQuery):
         db = load_db()
         bot_info = db["bots"].get(bid)
         if bot_info:
-            bot.edit_message_text(f"⚙️ **Bot Manager**\n\n📛 **Name:** `{bot_info['name']}`\n📊 **Status:** 🔴 Stopped", chat_id=chat_id, message_id=c.message.message_id, reply_markup=bot_control_kb(bid))
+            bot.edit_message_text(f"⚙️ **Project Details**\n\n📛 **Name:** `{bot_info['name']}`\n📊 **Status:** 🔴 Stopped", chat_id=chat_id, message_id=c.message.message_id, reply_markup=bot_control_kb(bid, False))
 
     elif data.startswith("act_logs_"):
         bid = data[9:]
         logs = get_hosted_logs(bid)
-        bot.send_message(chat_id, f"📋 **Console Logs ({bid}):**\n\n<pre>{logs[:3800]}</pre>", reply_markup=bot_control_kb(bid))
+        bot.send_message(chat_id, f"📋 **Console Logs ({bid}):**\n\n<pre>{logs[:3800]}</pre>")
 
     elif data.startswith("act_del_"):
         bid = data[8:]
@@ -381,14 +450,14 @@ def handle_callbacks(c: types.CallbackQuery):
             if suid in db["users"] and bid in db["users"][suid]["bots"]:
                 db["users"][suid]["bots"].remove(bid)
             save_db(db)
-        bot.answer_callback_query(c.id, "🗑️ বট সফলভাবে মুছে ফেলা হয়েছে!")
+        bot.answer_callback_query(c.id, "🗑️ সফলভাবে মুছে ফেলা হয়েছে!")
         bot.edit_message_text("🤖 **Main Control Panel**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=main_menu_kb())
 
     bot.answer_callback_query(c.id)
 
 # ==================== START POLLING ====================
 if __name__ == "__main__":
-    print("🤖 Main Bot Hosting Control Panel Started!")
+    print("🤖 Bot & HTML Hosting Engine Started!")
     try:
         bot.delete_webhook()
     except Exception:
