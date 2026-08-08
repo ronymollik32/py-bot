@@ -1,434 +1,404 @@
+"""
+🤖 ADVANCED TELEGRAM BOT HOSTING BOT (Render Compatible)
+সব ধরণের Python/Node.js টেলিগ্রাম বট অটোমেটিক প্যাকেজ ইনস্টলসহ হোস্ট করার বট
+"""
+
 import os
+import sys
 import json
 import subprocess
 import shutil
 import secrets
 import time
 import threading
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import requests
 
-# ==================== CONFIG ====================
-# আপনার দেওয়া টোকেন এবং অ্যাডমিন আইডি সেট করা হয়েছে
+# ==================== CONFIGURATION ====================
 TOKEN = "8173098705:AAHaFQDF4YA7QNBkAaWS2ku9JiuZuzj-8_Y"
 OWNER_ID = 7472542379
 
-BOTS_DIR = Path("bots")
+BOTS_DIR = Path("hosted_bots")
 BOTS_DIR.mkdir(exist_ok=True)
 
-DB_FILE = Path("db.json")
+DB_FILE = Path("database.json")
 
-# ==================== DUMMY WEB SERVER (FOR RENDER) ====================
+# ==================== RENDER DUMMY WEB SERVER ====================
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Bot Hosting Bot is Running on Render!")
+        self.wfile.write(b"Bot Hosting Panel is Live 24/7!")
 
-def keep_alive():
+def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    print(f"🌐 Dummy web server is running on port {port}")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        server = HTTPServer(('0.0.0.0', port), DummyHandler)
+        print(f"🌐 Keep-Alive server listening on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Server warning: {e}")
 
-# ==================== DATABASE ====================
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+# ==================== DATABASE MANAGEMENT ====================
 def load_db() -> dict:
     if DB_FILE.exists():
-        return json.loads(DB_FILE.read_text())
-    return {"users": {}, "bots": {}, "pending": {}}
+        try:
+            return json.loads(DB_FILE.read_text())
+        except:
+            pass
+    return {"users": {}, "bots": {}}
 
 def save_db(db: dict):
     DB_FILE.write_text(json.dumps(db, indent=2))
 
-# ==================== TELEGRAM BOT SETUP ====================
+# ==================== TELEGRAM BOT INITIALIZATION ====================
 try:
     import telebot
     from telebot import types
 except ImportError:
-    os.system("pip install pyTelegramBotAPI")
+    subprocess.run([sys.executable, "-m", "pip", "install", "pyTelegramBotAPI"])
     import telebot
     from telebot import types
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
-RUNNING = {}
+RUNNING_PROCESSES = {}
 
-# ==================== HELPERS ====================
-def is_admin(uid: int) -> bool:
-    return uid == OWNER_ID
-
+# ==================== HELPER FUNCTIONS ====================
 def get_user(uid: int) -> dict:
     db = load_db()
-    if str(uid) not in db["users"]:
-        db["users"][str(uid)] = {"plan": "free", "bots": [], "joined": str(datetime.now())}
+    suid = str(uid)
+    if suid not in db["users"]:
+        db["users"][suid] = {"plan": "free", "bots": [], "joined": str(datetime.now())}
         save_db(db)
-    return db["users"][str(uid)]
+    return db["users"][suid]
 
 def can_create_bot(uid: int) -> bool:
     user = get_user(uid)
-    max_bots = {"free": 2, "premium": 5, "pro": 10}.get(user.get("plan", "free"), 2)
-    return len(user.get("bots", [])) < max_bots
+    limit = {"free": 3, "premium": 10, "pro": 25}.get(user.get("plan", "free"), 3)
+    return len(user.get("bots", [])) < limit
 
-def bot_status(bid: str) -> str:
-    if bid in RUNNING and RUNNING[bid]["process"].poll() is None:
-        return "🟢 Running"
-    return "🔴 Stopped"
+def find_entry_file(bot_dir: Path):
+    """ফোল্ডারের ভেতরে যেকোনো জায়গায় মেইন ফাইল খুঁজে বের করে"""
+    targets = ["main.py", "bot.py", "app.py", "index.js", "bot.js", "server.js"]
+    for target in targets:
+        found = list(bot_dir.rglob(target))
+        if found:
+            return found[0]  # Return absolute Path object
+    return None
 
-def get_logs(bid: str, lines: int = 20) -> str:
-    if bid in RUNNING:
-        log = RUNNING[bid].get("logs", [])
-        return "\n".join(log[-lines:])
-    return "Bot is not running."
+def install_dependencies(bot_dir: Path):
+    """আপলোড করা বটের requirements.txt থাকলে অটো ইনস্টল করে"""
+    req_files = list(bot_dir.rglob("requirements.txt"))
+    if req_files:
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_files[0])],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            return True
+        except Exception as e:
+            print(f"Req install error: {e}")
+    return False
 
-# ==================== BOT MANAGEMENT ====================
-def start_bot(bid: str):
+# ==================== PROCESS CONTROL ====================
+def start_hosted_bot(bid: str) -> str:
     db = load_db()
-    bot_data = db["bots"].get(bid)
-    if not bot_data:
-        return "Bot not found"
-    
-    bot_dir = Path(bot_data["path"])
+    bot_info = db["bots"].get(bid)
+    if not bot_info:
+        return "❌ বট খুঁজে পাওয়া যায়নি!"
+
+    bot_dir = Path(bot_info["path"])
     if not bot_dir.exists():
-        return "Bot folder missing"
-    
-    # Detect entry file
-    entry = None
-    for f in ["bot.py", "main.py", "app.py", "index.js", "bot.js"]:
-        if (bot_dir / f).exists():
-            entry = f
-            break
-    
-    if not entry:
-        return "No entry file found (bot.py / main.py / index.js)"
-    
-    # Start process
-    cmd = ["python3", entry] if entry.endswith(".py") else ["node", entry]
-    
+        return "❌ বটের ফোল্ডারটি মিসিং!"
+
+    entry_path = find_entry_file(bot_dir)
+    if not entry_path:
+        return "❌ কোনো মেইন ফাইল পাওয়া যায়নি! (main.py, bot.py, index.js ইত্যাদি থাকা আবশ্যক)"
+
+    # ইনস্টল ডিপেনডেন্সি
+    install_dependencies(bot_dir)
+
+    # ফাইলটাইপ অনুযায়ী রান কমান্ড
+    is_python = entry_path.suffix == ".py"
+    cmd = [sys.executable, entry_path.name] if is_python else ["node", entry_path.name]
+
     try:
         proc = subprocess.Popen(
             cmd,
-            cwd=str(bot_dir),
+            cwd=str(entry_path.parent),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1
         )
-        
-        RUNNING[bid] = {
+
+        RUNNING_PROCESSES[bid] = {
             "process": proc,
-            "logs": [],
+            "logs": [f"🚀 Starting {entry_path.name}..."],
             "started": time.time()
         }
-        
-        # Log reader thread
-        def read_logs():
+
+        # ব্যাকগ্রাউন্ডে লগ রিডার
+        def capture_logs():
             for line in iter(proc.stdout.readline, ""):
-                if bid in RUNNING:
-                    RUNNING[bid]["logs"].append(line.strip())
-                    if len(RUNNING[bid]["logs"]) > 200:
-                        RUNNING[bid]["logs"] = RUNNING[bid]["logs"][-200:]
-        
-        threading.Thread(target=read_logs, daemon=True).start()
-        return "✅ Bot started successfully!"
+                if bid in RUNNING_PROCESSES:
+                    RUNNING_PROCESSES[bid]["logs"].append(line.strip())
+                    if len(RUNNING_PROCESSES[bid]["logs"]) > 150:
+                        RUNNING_PROCESSES[bid]["logs"].pop(0)
+
+        threading.Thread(target=capture_logs, daemon=True).start()
+        return "🟢 বট সফলভাবে চালু হয়েছে!"
     except Exception as e:
-        return f"❌ Failed to start: {e}"
+        return f"❌ চালু করতে ব্যর্থ: {str(e)}"
 
-def stop_bot(bid: str):
-    if bid in RUNNING:
+def stop_hosted_bot(bid: str) -> str:
+    if bid in RUNNING_PROCESSES:
         try:
-            RUNNING[bid]["process"].terminate()
-            RUNNING[bid]["process"].wait(timeout=5)
+            proc = RUNNING_PROCESSES[bid]["process"]
+            proc.terminate()
+            proc.wait(timeout=3)
         except:
-            RUNNING[bid]["process"].kill()
-        del RUNNING[bid]
-        return "✅ Bot stopped"
-    return "Bot is not running"
+            try:
+                RUNNING_PROCESSES[bid]["process"].kill()
+            except:
+                pass
+        del RUNNING_PROCESSES[bid]
+        return "🔴 বট বন্ধ করা হয়েছে।"
+    return "⚠️ বটটি ইতিপূর্বে বন্ধ ছিল।"
 
-def delete_bot(bid: str):
-    stop_bot(bid)
-    db = load_db()
-    if bid in db["bots"]:
-        bot_path = Path(db["bots"][bid]["path"])
-        shutil.rmtree(bot_path, ignore_errors=True)
-        del db["bots"][bid]
-        save_db(db)
-        return "✅ Bot deleted"
-    return "Bot not found"
+def get_hosted_logs(bid: str) -> str:
+    if bid in RUNNING_PROCESSES:
+        logs = RUNNING_PROCESSES[bid].get("logs", [])
+        if not logs:
+            return "লগ লোড হচ্ছে..."
+        return "\n".join(logs[-25:])
+    return "⚠️ বট বন্ধ রয়েছে। কোনো রানিং লগ নেই।"
 
 # ==================== KEYBOARDS ====================
-def main_kb() -> types.InlineKeyboardMarkup:
+def main_menu_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"),
-        types.InlineKeyboardButton("📤 Upload Bot", callback_data="upload_bot"),
+        types.InlineKeyboardButton("🤖 My Bots", callback_data="menu_my_bots"),
+        types.InlineKeyboardButton("📤 Upload Bot", callback_data="menu_upload")
     )
     kb.add(
-        types.InlineKeyboardButton("👤 Profile", callback_data="profile"),
-        types.InlineKeyboardButton("💳 Plans", callback_data="plans"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("🆘 Help", callback_data="help"),
+        types.InlineKeyboardButton("👤 Profile", callback_data="menu_profile"),
+        types.InlineKeyboardButton("💳 Plans", callback_data="menu_plans")
     )
     return kb
 
-def bot_actions_kb(bid: str) -> types.InlineKeyboardMarkup:
+def bot_control_kb(bid: str) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
-    running = bid in RUNNING and RUNNING[bid]["process"].poll() is None
-    
-    if running:
-        kb.add(types.InlineKeyboardButton("⏹ Stop", callback_data=f"stop_{bid}"))
+    is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
+
+    if is_running:
+        kb.add(types.InlineKeyboardButton("⏹️ Stop Bot", callback_data=f"act_stop_{bid}"))
     else:
-        kb.add(types.InlineKeyboardButton("▶️ Start", callback_data=f"start_{bid}"))
-    
+        kb.add(types.InlineKeyboardButton("▶️ Start Bot", callback_data=f"act_start_{bid}"))
+
     kb.add(
-        types.InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bid}"),
-        types.InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{bid}"),
+        types.InlineKeyboardButton("📋 View Logs", callback_data=f"act_logs_{bid}"),
+        types.InlineKeyboardButton("🗑️ Delete", callback_data=f"act_del_{bid}")
     )
-    kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="my_bots"))
+    kb.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
     return kb
 
-# ==================== HANDLERS ====================
+# ==================== BOT HANDLERS ====================
 @bot.message_handler(commands=['start'])
 def cmd_start(m: types.Message):
     get_user(m.from_user.id)
-    bot.send_message(
-        m.chat.id,
-        f"👋 Welcome {m.from_user.first_name}!\n\n"
-        f"<b>🤖 Bot Hosting Panel</b>\n"
-        f"Upload your bot and run it 24/7!\n\n"
-        f"Send a <b>.zip</b>, <b>.py</b> or <b>.js</b> file to upload.",
-        reply_markup=main_kb()
+    text = (
+        f"👋 **Hello {m.from_user.first_name}!**\n\n"
+        f"🤖 **Bot Hosting Server Panel**\n"
+        f"আপনার Python বা Node.js বট এখানে সম্পূর্ণ বিনামূল্যে ২৪/৭ হোস্ট করুন।\n\n"
+        f"📤 বট আপলোড করতে সরাসরি `.zip` বা `.py` ফাইল এই চ্যাটে পাঠান।"
     )
-
-@bot.message_handler(commands=['help'])
-def cmd_help(m: types.Message):
-    help_text = """
-<b>📖 How to use:</b>
-
-1️⃣ <b>Upload Bot</b>
-   Send .zip, .py or .js file
-
-2️⃣ <b>Start Bot</b>
-   My Bots → Select → Start
-
-3️⃣ <b>View Logs</b>
-   See what your bot is doing
-
-4️⃣ <b>Stop/Delete</b>
-   Manage your bots anytime
-
-<b>📦 Supported:</b>
-• Python (bot.py/main.py)
-• Node.js (index.js/bot.js)
-"""
-    bot.send_message(m.chat.id, help_text, reply_markup=main_kb())
+    bot.send_message(m.chat.id, text, reply_markup=main_menu_kb())
 
 @bot.message_handler(content_types=['document'])
-def handle_upload(m: types.Message):
+def handle_file_upload(m: types.Message):
     uid = m.from_user.id
     user = get_user(uid)
-    
+
     if not can_create_bot(uid):
-        bot.reply_to(m, f"❌ Bot limit reached! Upgrade to create more bots.")
+        bot.reply_to(m, "❌ আপনার বট লিমিট শেষ! আরও বট হোস্ট করতে প্ল্যান আপগ্রেড করুন।")
         return
-    
+
     doc = m.document
-    if not doc.file_name.endswith(('.zip', '.py', '.js')):
-        bot.reply_to(m, "❌ Only .zip, .py, .js files allowed")
+    fname = doc.file_name.lower()
+    if not (fname.endswith('.zip') or fname.endswith('.py') or fname.endswith('.js')):
+        bot.reply_to(m, "❌ শুধুমাত্র `.zip`, `.py` অথবা `.js` ফাইল গ্রহণযোগ্য।")
         return
-    
-    file_info = bot.get_file(doc.file_id)
-    file_data = bot.download_file(file_info.file_path)
-    
-    bot_id = secrets.token_hex(6)
-    bot_path = BOTS_DIR / bot_id
-    bot_path.mkdir(parents=True, exist_ok=True)
-    
-    if doc.file_name.endswith('.zip'):
-        import zipfile
-        from io import BytesIO
-        with zipfile.ZipFile(BytesIO(file_data)) as zf:
-            zf.extractall(bot_path)
-    else:
-        (bot_path / doc.file_name).write_bytes(file_data)
-    
-    db = load_db()
-    db["bots"][bot_id] = {
-        "name": doc.file_name,
-        "path": str(bot_path),
-        "owner": uid,
-        "uploaded": str(datetime.now())
-    }
-    user["bots"].append(bot_id)
-    save_db(db)
-    
-    bot.reply_to(
-        m,
-        f"✅ <b>Bot uploaded!</b>\n"
-        f"ID: <code>{bot_id}</code>\n"
-        f"File: {doc.file_name}\n\n"
-        f"Go to My Bots to start it."
-    )
+
+    msg = bot.reply_to(m, "⏳ ফাইল প্রসেস করা হচ্ছে এবং ডিপেনডেন্সি চেক করা হচ্ছে...")
+
+    try:
+        file_info = bot.get_file(doc.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+
+        bot_id = secrets.token_hex(4)
+        bot_dir = BOTS_DIR / bot_id
+        bot_dir.mkdir(parents=True, exist_ok=True)
+
+        if fname.endswith('.zip'):
+            with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
+                zf.extractall(bot_dir)
+        else:
+            (bot_dir / doc.file_name).write_bytes(file_bytes)
+
+        entry = find_entry_file(bot_dir)
+        if not entry:
+            shutil.rmtree(bot_dir, ignore_errors=True)
+            bot.edit_message_text("❌ আপলোড করা ফাইলে কোনো মূল ফাইল (`main.py`, `bot.py`, `index.js`) পাওয়া যায়নি!", chat_id=m.chat.id, message_id=msg.message_id)
+            return
+
+        db = load_db()
+        db["bots"][bot_id] = {
+            "name": doc.file_name,
+            "path": str(bot_dir),
+            "owner": uid,
+            "uploaded": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+        user["bots"].append(bot_id)
+        save_db(db)
+
+        bot.edit_message_text(
+            f"✅ **বট আপলোড সফল হয়েছে!**\n\n"
+            f"🆔 **Bot ID:** `+{bot_id}`\n"
+            f"📁 **File:** `{doc.file_name}`\n"
+            f"📄 **Entry:** `{entry.name}`\n\n"
+            f"নিচের **My Bots** অপশনে গিয়ে বট চালু করুন।",
+            chat_id=m.chat.id,
+            message_id=msg.message_id,
+            reply_markup=main_menu_kb()
+        )
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ আপলোড ব্যর্থ হয়েছে: {str(e)}", chat_id=m.chat.id, message_id=msg.message_id)
 
 @bot.callback_query_handler(func=lambda c: True)
-def handle_callback(c: types.CallbackQuery):
+def handle_callbacks(c: types.CallbackQuery):
     data = c.data
-    
-    if data == "my_bots":
-        show_my_bots(c)
-    
-    elif data == "upload_bot":
-        bot.send_message(
-            c.message.chat.id,
-            "📤 Send your bot file (.zip / .py / .js)",
-            reply_markup=main_kb()
-        )
-    
-    elif data == "profile":
-        uid = c.from_user.id
+    uid = c.from_user.id
+    chat_id = c.message.chat.id
+
+    if data == "menu_main":
+        bot.edit_message_text("🤖 **Main Control Panel**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=main_menu_kb())
+
+    elif data == "menu_my_bots":
+        db = load_db()
         user = get_user(uid)
-        bot_count = len(user.get("bots", []))
-        plan = user.get("plan", "free")
-        
-        bot.send_message(
-            c.message.chat.id,
-            f"<b>👤 Profile</b>\n\n"
-            f"ID: <code>{uid}</code>\n"
-            f"Plan: <b>{plan.upper()}</b>\n"
-            f"Bots: {bot_count}\n"
-            f"Joined: {user.get('joined', 'Unknown')[:10]}",
-            reply_markup=main_kb()
+        user_bots = user.get("bots", [])
+
+        if not user_bots:
+            bot.answer_callback_query(c.id, "আপনার কোনো আপলোড করা বট নেই!")
+            return
+
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for bid in user_bots:
+            if bid in db["bots"]:
+                bname = db["bots"][bid]["name"]
+                is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
+                status = "🟢" if is_running else "🔴"
+                kb.add(types.InlineKeyboardButton(f"{status} {bname}", callback_data=f"select_{bid}"))
+
+        kb.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
+        bot.edit_message_text("🤖 **আপনার হোস্ট করা বট সমূহের তালিকা:**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=kb)
+
+    elif data == "menu_upload":
+        bot.send_message(chat_id, "📤 আপনার বটের `.zip` অথবা `.py` ফাইলটি চ্যাটে সেন্ড করুন।")
+        bot.answer_callback_query(c.id)
+
+    elif data == "menu_profile":
+        user = get_user(uid)
+        bot.edit_message_text(
+            f"👤 **User Profile**\n\n"
+            f"🆔 **ID:** `{uid}`\n"
+            f"💎 **Plan:** `{user.get('plan', 'free').upper()}`\n"
+            f"🤖 **Total Bots:** {len(user.get('bots', []))}\n"
+            f"📅 **Joined:** {user.get('joined', '')[:10]}",
+            chat_id=chat_id,
+            message_id=c.message.message_id,
+            reply_markup=main_menu_kb()
         )
-    
-    elif data == "plans":
-        show_plans(c)
-    
-    elif data == "help":
-        cmd_help(c.message)
-    
-    elif data.startswith("bot_"):
-        bid = data[4:]
-        show_bot_detail(c, bid)
-    
-    elif data.startswith("start_"):
-        bid = data[6:]
-        result = start_bot(bid)
-        bot.answer_callback_query(c.id, result)
-        show_bot_detail(c, bid)
-    
-    elif data.startswith("stop_"):
-        bid = data[5:]
-        result = stop_bot(bid)
-        bot.answer_callback_query(c.id, result)
-        show_bot_detail(c, bid)
-    
-    elif data.startswith("logs_"):
-        bid = data[5:]
-        logs = get_logs(bid, 30)
-        bot.send_message(
-            c.message.chat.id,
-            f"<b>📋 Logs for {bid}</b>\n\n<pre>{logs[:3500]}</pre>",
-            reply_markup=bot_actions_kb(bid)
-        )
-    
-    elif data.startswith("delete_"):
+
+    elif data.startswith("select_"):
         bid = data[7:]
-        result = delete_bot(bid)
-        bot.answer_callback_query(c.id, result)
-        show_my_bots(c)
-    
+        db = load_db()
+        bot_info = db["bots"].get(bid)
+
+        if not bot_info:
+            bot.answer_callback_query(c.id, "বট খুঁজে পাওয়া যায়নি!")
+            return
+
+        is_running = bid in RUNNING_PROCESSES and RUNNING_PROCESSES[bid]["process"].poll() is None
+        status = "🟢 Running" if is_running else "🔴 Stopped"
+
+        bot.edit_message_text(
+            f"⚙️ **Bot Manager**\n\n"
+            f"📛 **Name:** `{bot_info['name']}`\n"
+            f"🆔 **ID:** `{bid}`\n"
+            f"📊 **Status:** {status}\n"
+            f"📅 **Uploaded:** {bot_info.get('uploaded', 'N/A')}",
+            chat_id=chat_id,
+            message_id=c.message.message_id,
+            reply_markup=bot_control_kb(bid)
+        )
+
+    elif data.startswith("act_start_"):
+        bid = data[10:]
+        bot.answer_callback_query(c.id, "বট চালু হচ্ছে...")
+        res = start_hosted_bot(bid)
+        bot.send_message(chat_id, res)
+        # Refresh state
+        db = load_db()
+        bot_info = db["bots"].get(bid)
+        if bot_info:
+            bot.edit_message_text(f"⚙️ **Bot Manager**\n\n📛 **Name:** `{bot_info['name']}`\n📊 **Status:** 🟢 Running", chat_id=chat_id, message_id=c.message.message_id, reply_markup=bot_control_kb(bid))
+
+    elif data.startswith("act_stop_"):
+        bid = data[9:]
+        res = stop_hosted_bot(bid)
+        bot.answer_callback_query(c.id, res)
+        db = load_db()
+        bot_info = db["bots"].get(bid)
+        if bot_info:
+            bot.edit_message_text(f"⚙️ **Bot Manager**\n\n📛 **Name:** `{bot_info['name']}`\n📊 **Status:** 🔴 Stopped", chat_id=chat_id, message_id=c.message.message_id, reply_markup=bot_control_kb(bid))
+
+    elif data.startswith("act_logs_"):
+        bid = data[9:]
+        logs = get_hosted_logs(bid)
+        bot.send_message(chat_id, f"📋 **Console Logs ({bid}):**\n\n<pre>{logs[:3800]}</pre>", reply_markup=bot_control_kb(bid))
+
+    elif data.startswith("act_del_"):
+        bid = data[8:]
+        stop_hosted_bot(bid)
+        db = load_db()
+        if bid in db["bots"]:
+            shutil.rmtree(db["bots"][bid]["path"], ignore_errors=True)
+            del db["bots"][bid]
+            if str(uid) in db["users"] and bid in db["users"][str(uid)]["bots"]:
+                db["users"][str(uid)]["bots"].remove(bid)
+            save_db(db)
+        bot.answer_callback_query(c.id, "🗑️ বট সফলভাবে মুছে ফেলা হয়েছে!")
+        bot.edit_message_text("🤖 **Main Control Panel**", chat_id=chat_id, message_id=c.message.message_id, reply_markup=main_menu_kb())
+
     bot.answer_callback_query(c.id)
 
-def show_my_bots(c):
-    uid = c.from_user.id
-    db = load_db()
-    user = db["users"].get(str(uid), {})
-    bot_ids = user.get("bots", [])
-    
-    if not bot_ids:
-        bot.send_message(
-            c.message.chat.id,
-            "🤖 <b>No bots yet!</b>\n\nUpload your first bot by sending a .zip file.",
-            reply_markup=main_kb()
-        )
-        return
-    
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for bid in bot_ids:
-        if bid in db["bots"]:
-            name = db["bots"][bid].get("name", bid)[:20]
-            status_icon = "🟢" if bid in RUNNING and RUNNING[bid]["process"].poll() is None else "🔴"
-            kb.add(types.InlineKeyboardButton(f"{status_icon} {name}", callback_data=f"bot_{bid}"))
-    
-    kb.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="main"))
-    
-    bot.send_message(
-        c.message.chat.id,
-        f"🤖 <b>Your Bots</b> ({len(bot_ids)} total)",
-        reply_markup=kb
-    )
-
-def show_bot_detail(c, bid: str):
-    db = load_db()
-    bot_data = db["bots"].get(bid)
-    if not bot_data:
-        bot.send_message(c.message.chat.id, "❌ Bot not found")
-        return
-    
-    status = bot_status(bid)
-    uptime = ""
-    if bid in RUNNING and RUNNING[bid]["process"].poll() is None:
-        elapsed = int(time.time() - RUNNING[bid].get("started", time.time()))
-        uptime = f"Uptime: {elapsed//60}m {elapsed%60}s"
-    
-    bot.send_message(
-        c.message.chat.id,
-        f"<b>🤖 {bot_data.get('name', bid)}</b>\n\n"
-        f"Status: {status}\n"
-        f"ID: <code>{bid}</code>\n"
-        f"{uptime}\n"
-        f"Uploaded: {bot_data.get('uploaded', 'Unknown')[:10]}",
-        reply_markup=bot_actions_kb(bid)
-    )
-
-def show_plans(c):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    plans = [
-        ("Free", "2 bots", "0"),
-        ("Premium", "5 bots", "99"),
-        ("Pro", "10 bots", "199"),
-    ]
-    
-    for name, features, price in plans:
-        kb.add(types.InlineKeyboardButton(
-            f"💎 {name} - {price}$", callback_data=f"plan_{name.lower()}"
-        ))
-    
-    kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="main"))
-    
-    bot.send_message(
-        c.message.chat.id,
-        "<b>💳 Plans</b>\n\n"
-        "Free: 2 bots\n"
-        "Premium: 5 bots (99$)\n"
-        "Pro: 10 bots (199$)\n\n"
-        "Contact @support to upgrade!",
-        reply_markup=kb
-    )
-
-# ==================== RUN ====================
+# ==================== START POLLING ====================
 if __name__ == "__main__":
-    print("🤖 Bot Hosting Bot Started!")
-    
-    # Render.com এর জন্য Dummy Server চালু করা হচ্ছে
-    keep_alive()
-
-    # Webhook ক্লিয়ার করে পোলিং শুরু করা
+    print("🤖 Main Bot Hosting Control Panel Started!")
     try:
         bot.delete_webhook()
-    except Exception as e:
+    except:
         pass
+    bot.infinity_polling(skip_pending=True)
     
-    bot.infinity_polling()
